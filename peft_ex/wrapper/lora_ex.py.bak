@@ -27,6 +27,7 @@ __all__ = [
     'LoraExLayer',
     'LoraExModel',
     'LoraExLinear',
+    'LoraExLayerNorm'
 ]
 
 
@@ -36,6 +37,7 @@ class LoraExConfig(PeftConfig):
     r: int = field(default=2)
     weight_dropout: float = field(default=0.1)
     grad_norm: str = field(default='layer')
+    grad_norm_eps: float = field(default=1e-8)
     sh: bool = field(default=False)
     init_weights: bool = field(default=True)
 
@@ -55,7 +57,7 @@ class Decomposition(object):
         pass
 
 
-class LoraExDecompositionNd(Decomposition):
+class LoraExDecomposition2d(Decomposition):
 
     def __init__(self, module, param_name, config: LoraExConfig, context):
         self.module = module
@@ -66,26 +68,36 @@ class LoraExDecompositionNd(Decomposition):
         self.a = nn.ParameterDict()
         self.b = nn.ParameterDict()
 
-        setattr(module, f'{param_name}_lora_A', self.a)
-        setattr(module, f'{param_name}_lora_B', self.b)
+        setattr(module, f'{param_name}_LoraExA', self.a)
+        setattr(module, f'{param_name}_LoraExB', self.b)
 
         if self.config.sh:
             self.sh = nn.ParameterDict()
-            setattr(module, f'{param_name}_lora_H', self.sh)
+            setattr(module, f'{param_name}_LoraExH', self.sh)
 
     def decompose(self, adapter_name):
         r = self.config.r
         param = getattr(self.module, self.param_name)
+        assert len(param.shape) == 2, 'Parameter should be a 2d tensor.'
         h, w = param.shape
         dtype = param.dtype
         device = param.device
+
+        if self.config.sh:
+            if adapter_name not in self.context:
+                sh = nn.Parameter(torch.zeros((r, r), dtype=dtype, device=device), requires_grad=True)
+                self.context[adapter_name] = sh
+            self.sh[adapter_name] = self.context[adapter_name]
 
         a = nn.Parameter(torch.empty((h, r), dtype=dtype, device=device), requires_grad=True)
         b = nn.Parameter(torch.empty((r, w), dtype=dtype, device=device), requires_grad=True)
 
         if self.config.init_weights:
-            init.zeros_(a)
             std = math.sqrt(2.0 / (h + w))
+            if self.config.sh:
+                init.trunc_normal_(a, 0, std, -2 * std, 2 * std)
+            else:
+                init.zeros_(a)
             init.trunc_normal_(b, 0, std, -2 * std, 2 * std)
 
         if self.config.grad_norm == 'layer':
@@ -95,17 +107,11 @@ class LoraExDecompositionNd(Decomposition):
         else:
             grad_norm_ = None
         if grad_norm_ is not None:
-            a.register_hook(partial(self._grad_hook, grad_norm_=grad_norm_, dim=0))
-            b.register_hook(partial(self._grad_hook, grad_norm_=grad_norm_, dim=1))
+            a.register_hook(partial(self._grad_hook, grad_norm_=grad_norm_, dim=0, eps=self.config.grad_norm_eps))
+            b.register_hook(partial(self._grad_hook, grad_norm_=grad_norm_, dim=1, eps=self.config.grad_norm_eps))
 
         self.a[adapter_name] = a
         self.b[adapter_name] = b
-
-        if self.config.sh:
-            if adapter_name not in self.context:
-                sh = nn.Parameter(torch.eye(r, dtype=dtype, device=device), requires_grad=True)
-                self.context[adapter_name] = sh
-            self.sh[adapter_name] = self.context[adapter_name]
 
     def compose(self, adapter_name):
         a = self.a[adapter_name]
@@ -118,10 +124,55 @@ class LoraExDecompositionNd(Decomposition):
         return dp
 
     @staticmethod
-    def _grad_hook(grad, grad_norm_, dim):
+    def _grad_hook(grad, grad_norm_, dim, eps):
         with torch.no_grad():
-            grad_norm_(grad, dim)
+            grad_norm_(grad, dim, eps)
         return grad
+
+    def merge(self, adapter_name):
+        param = getattr(self.module, self.param_name)
+        param.add_(self.compose(adapter_name))
+
+    def unmerge(self, adapter_name):
+        param = getattr(self.module, self.param_name)
+        param.sub_(self.compose(adapter_name))
+
+
+class LoraExDecomposition1d(Decomposition):
+
+    def __init__(self, module, param_name, config: LoraExConfig, context):
+        self.module = module
+        self.param_name = param_name
+        self.config = config
+        self.context = context
+
+        self.scale = nn.ParameterDict()
+        setattr(module, f'{param_name}_LoraExScale', self.scale)
+        self.shift = nn.ParameterDict()
+        setattr(module, f'{param_name}_LoraExShift', self.shift)
+
+    def decompose(self, adapter_name):
+        param = getattr(self.module, self.param_name)
+        assert len(param.shape) == 1, 'Parameter should be a 1d tensor.'
+        dtype = param.dtype
+        device = param.device
+
+        scale = nn.Parameter(torch.empty((), dtype=dtype, device=device), requires_grad=True)
+        shift = nn.Parameter(torch.empty((), dtype=dtype, device=device), requires_grad=True)
+
+        if self.config.init_weights:
+            init.zeros_(scale)
+            init.zeros_(shift)
+
+        self.scale[adapter_name] = scale
+        self.shift[adapter_name] = shift
+
+    def compose(self, adapter_name):
+        param = getattr(self.module, self.param_name)
+        scale = self.scale[adapter_name]
+        shift = self.shift[adapter_name]
+        dp = scale * param + shift
+        return dp
 
     def merge(self, adapter_name):
         param = getattr(self.module, self.param_name)
@@ -173,6 +224,7 @@ class LoraExModel(BaseTuner):
         self.context = {}
         super().__init__(model, config, adapter_name)
 
+    # noinspection PyMethodOverriding
     @staticmethod
     def _check_target_module_exists(config, key):
         if isinstance(config.target_modules, str):
@@ -205,6 +257,7 @@ class LoraExModel(BaseTuner):
             target.add_adapter(adapter_name)
         else:
             if isinstance(target, nn.Linear):
+                # print(f'Linear {target_name}')
                 new_module = LoraExLinear(
                     adapter_name=adapter_name,
                     config=config,
@@ -212,6 +265,19 @@ class LoraExModel(BaseTuner):
                     in_features=target.in_features,
                     out_features=target.out_features,
                     bias=target.bias is not None
+                )
+                self._replace_module(parent, new_module, target_name, target, ['weight', 'bias'])
+            elif isinstance(target, nn.LayerNorm):
+                # print(f'LayerNorm {target_name}')
+                new_module = LoraExLayerNorm(
+                    adapter_name=adapter_name,
+                    config=config,
+                    context=self.context,
+                    normalized_shape=[*target.normalized_shape],
+                    eps=target.eps,
+                    elementwise_affine=target.elementwise_affine,
+                    device=target.weight.device if target.weight is not None else None,
+                    dtype=target.weight.dtype if target.weight is not None else None
                 )
                 self._replace_module(parent, new_module, target_name, target, ['weight', 'bias'])
 
@@ -265,6 +331,11 @@ class LoraExModel(BaseTuner):
     def _prepare_adapter_config(self, peft_config, model_config):
         return peft_config
 
+    def merge(self):
+        for module in self.model.modules():
+            if isinstance(module, LoraExLayer):
+                module.merge()
+
     def merge_and_unload(self):
         raise NotImplementedError()
 
@@ -285,7 +356,7 @@ class LoraExLinear(nn.Linear, LoraExLayer):
         LoraExLayer.__init__(self)
         self.config = config
 
-        self.weight_decomposition = LoraExDecompositionNd(self, 'weight', config, context)
+        self.weight_decomposition = LoraExDecomposition2d(self, 'weight', config, context)
 
         self.weight.requires_grad = False
         if self.bias is not None:
@@ -309,4 +380,63 @@ class LoraExLinear(nn.Linear, LoraExLayer):
 
         result = result.to(previous_dtype)
 
+        return result
+
+
+class LoraExLayerNorm(nn.LayerNorm, LoraExLayer):
+
+    def __init__(
+            self,
+            adapter_name: str,
+            config: LoraExConfig,
+            context,
+            normalized_shape,
+            eps,
+            elementwise_affine,
+            device,
+            dtype
+    ):
+        nn.LayerNorm.__init__(
+            self,
+            normalized_shape=normalized_shape,
+            eps=eps,
+            elementwise_affine=elementwise_affine,
+            device=device,
+            dtype=dtype
+        )
+        LoraExLayer.__init__(self)
+        self.config = config
+
+        if self.weight is not None:
+            self.weight_decomposition = LoraExDecomposition1d(self, 'weight', config, context)
+        if self.bias is not None:
+            self.bias_decomposition = LoraExDecomposition1d(self, 'bias', config, context)
+
+        if self.weight is not None:
+            self.weight.requires_grad = False
+        if self.bias is not None:
+            self.bias.requires_grad = False
+
+        self.add_adapter(adapter_name)
+        self.active_adapter = adapter_name
+
+    def forward(self, x):
+        previous_dtype = x.dtype
+
+        if self.disable_adapters:
+            if self.merged:
+                self.unmerge()
+            result = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        elif not self.merged:
+            weight = None
+            if self.weight is not None:
+                weight = self.weight + self.weight_decomposition.compose(self.active_adapter)
+            bias = None
+            if self.bias is not None:
+                bias = self.bias + self.bias_decomposition.compose(self.active_adapter)
+            result = F.layer_norm(x, self.normalized_shape, weight, bias, self.eps)
+        else:
+            result = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+
+        result = result.to(previous_dtype)
         return result

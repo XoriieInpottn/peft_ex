@@ -5,18 +5,18 @@
 @since: 2023-08-10
 """
 
-from typing import Tuple
-
-import numpy as np
-import torch
-from torch.optim import Optimizer
-
 __all__ = [
     'PEFTOptimizer',
     'compute_flat_shape',
     'layer_grad_norm_',
     'rms_grad_norm_',
 ]
+
+from typing import Tuple
+
+import numpy as np
+import torch
+from torch.optim import Optimizer
 
 
 class PEFTOptimizer(Optimizer):
